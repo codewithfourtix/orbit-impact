@@ -1,0 +1,12 @@
+{
+  "//": "Copy to .gitlab/duo/mcp.json in the project you want analyzed, so the GitLab Duo Agent Platform (IDE surface) can call the orbit-impact tools. Adjust the absolute path to dist/index.js.",
+  "mcpServers": {
+    "orbit-impact": {
+      "command": "node",
+      "args": ["/absolute/path/to/orbit-impact/dist/index.js"],
+      "env": {
+        "ORBIT_BIN": "orbit"
+      }
+    }
+  }
+}

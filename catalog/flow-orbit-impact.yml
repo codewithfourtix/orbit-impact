@@ -1,0 +1,40 @@
+# AI Catalog artifact — "Orbit Impact Analyzer" (custom Flow, optional alternative to the Agent)
+#
+# Paste into GitLab → AI → Flows → New flow → Configuration editor.
+# The flow's name/description/visibility come from the UI form, NOT this YAML
+# (top-level name/description/product_group are rejected by the registry).
+# environment must be "ambient" for custom flows.
+#
+# This is a single-agent flow: one AgentComponent that reads the MR, calls the
+# orbit-impact tools, and posts the impact comment. Validate in the editor — the
+# registry v1 schema evolves; the Agent definition in agent-orbit-impact.md is
+# the lower-risk primary deliverable.
+version: "v1"
+environment: "ambient"
+
+components:
+  - name: "impact_review"
+    type: AgentComponent
+    prompt_id: "impact_review_prompt"
+    inputs:
+      - from: "context:project_id"
+        as: "project_id"
+      - from: "context:goal"
+        as: "merge_request_iid"
+
+prompts:
+  - id: "impact_review_prompt"
+    content: |
+      You are Orbit Impact Analyzer. For merge request {{merge_request_iid}} in
+      project {{project_id}}:
+      1. Read the MR diff and collect the names of changed function/class/method
+         definitions.
+      2. Call analyze_change(symbols=<those names>) — an orbit-impact tool backed
+         by the GitLab Knowledge Graph (Orbit) call graph.
+      3. Post the returned Markdown report as a single comment on the MR.
+      4. If any high-risk symbol is untested (has callers but no test files in its
+         blast radius), open an issue listing the untested callers.
+      Ground every dependent you mention in the tool output. Do not guess.
+
+flow:
+  entry: "impact_review"

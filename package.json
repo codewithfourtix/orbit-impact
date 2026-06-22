@@ -1,0 +1,42 @@
+{
+  "name": "orbit-impact",
+  "version": "0.1.0",
+  "description": "MCP server that turns the GitLab Knowledge Graph (Orbit) into high-level code-impact tools: blast-radius, caller analysis, and change-risk reports for AI agents.",
+  "type": "module",
+  "bin": {
+    "orbit-impact": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/index.ts",
+    "start": "node dist/index.js",
+    "smoke": "tsx src/smoke.ts",
+    "prepublishOnly": "npm run build"
+  },
+  "keywords": [
+    "gitlab",
+    "orbit",
+    "knowledge-graph",
+    "mcp",
+    "blast-radius",
+    "impact-analysis",
+    "code-intelligence",
+    "ai-agents"
+  ],
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.18.0",
+    "zod": "^3.25.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.7.0"
+  }
+}
