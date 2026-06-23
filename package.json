@@ -1,6 +1,6 @@
 {
   "name": "orbit-impact",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "MCP server that turns the GitLab Knowledge Graph (Orbit) into high-level code-impact tools: blast-radius, caller analysis, and change-risk reports for AI agents.",
   "type": "module",
   "bin": {
@@ -13,6 +13,8 @@
     "build": "tsc -p tsconfig.json",
     "dev": "tsx src/index.ts",
     "start": "node dist/index.js",
+    "cli": "node dist/index.js",
+    "test": "tsc -p tsconfig.json && node dist/difftest.js",
     "smoke": "tsx src/smoke.ts",
     "prepublishOnly": "npm run build"
   },

@@ -5,6 +5,10 @@ Step-by-step to publish the Showcase artifact and record the demo. Items marked
 
 ## Prerequisites
 - [x] Orbit installed, repo indexed, `orbit-impact` built & MCP-tested (done in WSL).
+- [x] Standalone CLI verified: `git diff | node dist/index.js diff` prints the
+      report with **no GitLab account or Duo credits required**. This is the
+      always-works core of the demo — record it even if the live Agent run is
+      flaky, since it proves the Orbit-powered impact analysis end-to-end.
 - [ ] **[Ali]** Personal GitLab.com account.
 - [ ] **[Ali]** GitLab Duo trial started (for Agent Platform execution credits).
 - [ ] **[Ali]** Public GitLab project created to host this MIT repo.

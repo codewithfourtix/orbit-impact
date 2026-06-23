@@ -5,20 +5,37 @@
  * connect a calling Definition (source) to the called Definition (target).
  * "Blast radius" of a symbol = the transitive closure of callers reachable by
  * walking CALLS edges *backwards* (target -> source).
+ *
+ * Two entry points matter:
+ *   - blastRadius(name)  — impact of a symbol named by hand.
+ *   - analyzeDiff(diff)  — impact of a *merge request*: parse the diff, map the
+ *                          changed lines onto the exact definitions that enclose
+ *                          them, then blast-radius each. No hand-naming, and no
+ *                          ambiguity — the diff pins each symbol to one file+line.
  */
 import { sql, lit } from "./orbit.js";
+import { parseUnifiedDiff, type FileChange } from "./diff.js";
 
 export interface Definition {
-  id: number;
+  // Orbit's ids are 64-bit and exceed JS's safe-integer range, so we surface
+  // them as strings (cast in SQL) to avoid silent precision loss on parse.
+  id: string;
   name: string;
   fqn: string | null;
   file_path: string;
   definition_type: string;
   start_line: number;
+  end_line: number;
+  project_id: string;
 }
 
 export interface ImpactedDef extends Definition {
   depth: number;
+}
+
+/** A definition the diff actually changed, plus which lines hit it. */
+export interface ChangedDef extends Definition {
+  changed_lines: number[];
 }
 
 export interface SymbolImpact {
@@ -46,6 +63,53 @@ function isTestFile(path: string): boolean {
   return TEST_RE.test(path);
 }
 
+/** Raw definition columns (real BIGINT id) — used inside the CTE for joins/grouping. */
+const DEF_COLS =
+  "id, name, fqn, file_path, definition_type, start_line, end_line, project_id";
+/** Output projection: ids cast to VARCHAR so they survive JSON without rounding. */
+const DEF_COLS_OUT =
+  "CAST(id AS VARCHAR) AS id, name, fqn, file_path, definition_type, start_line, end_line, CAST(project_id AS VARCHAR) AS project_id";
+
+/**
+ * Walk the CALLS graph backwards from a seed set of definitions and return every
+ * definition that (in)directly calls the seed, with the shortest hop distance.
+ * `seedWhere` is a SQL predicate selecting the seed rows from gl_definition.
+ *
+ * Edges are keyed by globally-unique definition ids, so the traversal can never
+ * cross from one indexed repo into another — the seed's project bounds it.
+ */
+async function traverse(
+  seedWhere: string,
+  maxDepth: number,
+): Promise<ImpactedDef[]> {
+  return sql<ImpactedDef>(`
+    WITH RECURSIVE impacted(${DEF_COLS}, depth) AS (
+      SELECT ${DEF_COLS}, 0
+      FROM gl_definition
+      WHERE ${seedWhere}
+      UNION
+      SELECT caller.id, caller.name, caller.fqn, caller.file_path,
+             caller.definition_type, caller.start_line, caller.end_line,
+             caller.project_id, i.depth + 1
+      FROM impacted i
+      JOIN gl_edge e
+        ON e.target_id = i.id AND e.target_kind = 'Definition'
+       AND e.relationship_kind = 'CALLS'
+      JOIN gl_definition caller
+        ON caller.id = e.source_id AND e.source_kind = 'Definition'
+      WHERE i.depth < ${maxDepth}
+    )
+    SELECT ${DEF_COLS_OUT}, MIN(depth) AS depth
+    FROM impacted
+    GROUP BY ${DEF_COLS}
+    ORDER BY depth, file_path, start_line
+  `);
+}
+
+function clampDepth(maxDepth?: number): number {
+  return Math.max(1, Math.min(maxDepth ?? 5, 25));
+}
+
 /** Find definitions by name. Exact by default; `fuzzy` does a substring match. */
 export async function findSymbol(
   name: string,
@@ -55,7 +119,7 @@ export async function findSymbol(
     ? `lower(name) LIKE lower(${lit(`%${name}%`)})`
     : `name = ${lit(name)}`;
   return sql<Definition>(`
-    SELECT id, name, fqn, file_path, definition_type, start_line
+    SELECT ${DEF_COLS_OUT}
     FROM gl_definition
     WHERE ${pred}
     ORDER BY file_path, start_line
@@ -64,43 +128,36 @@ export async function findSymbol(
 }
 
 /**
- * Transitive blast radius of a symbol: every definition that (in)directly calls
- * it, up to maxDepth hops. Depth 0 is the symbol itself; depth >= 1 are callers.
+ * Transitive blast radius of a symbol named by hand. Resolves the name (with an
+ * optional file disambiguator) and returns its caller closure + a risk summary.
  */
 export async function blastRadius(
   name: string,
   opts: { filePath?: string; maxDepth?: number } = {},
 ): Promise<SymbolImpact> {
-  const maxDepth = Math.max(1, Math.min(opts.maxDepth ?? 5, 25));
+  const maxDepth = clampDepth(opts.maxDepth);
   let seedPred = `name = ${lit(name)}`;
   if (opts.filePath) seedPred += ` AND file_path = ${lit(opts.filePath)}`;
 
-  const rows = await sql<ImpactedDef>(`
-    WITH RECURSIVE impacted(id, name, fqn, file_path, definition_type, start_line, depth) AS (
-      SELECT id, name, fqn, file_path, definition_type, start_line, 0
-      FROM gl_definition
-      WHERE ${seedPred}
-      UNION
-      SELECT caller.id, caller.name, caller.fqn, caller.file_path,
-             caller.definition_type, caller.start_line, i.depth + 1
-      FROM impacted i
-      JOIN gl_edge e
-        ON e.target_id = i.id AND e.target_kind = 'Definition'
-       AND e.relationship_kind = 'CALLS'
-      JOIN gl_definition caller
-        ON caller.id = e.source_id AND e.source_kind = 'Definition'
-      WHERE i.depth < ${maxDepth}
-    )
-    SELECT id, name, fqn, file_path, definition_type, start_line, MIN(depth) AS depth
-    FROM impacted
-    GROUP BY id, name, fqn, file_path, definition_type, start_line
-    ORDER BY depth, file_path, start_line
-  `);
-
+  const rows = await traverse(seedPred, maxDepth);
   const resolved = rows.filter((r) => r.depth === 0);
   const impacted = rows.filter((r) => r.depth >= 1);
-  const summary = summarize(resolved, impacted);
-  return { symbol: name, resolved, impacted, summary };
+  return { symbol: name, resolved, impacted, summary: summarize(resolved, impacted) };
+}
+
+/**
+ * Blast radius of a single definition the diff already pinned to one file+line —
+ * so there is no name ambiguity to resolve, unlike the by-name path.
+ */
+export async function blastRadiusFromDef(def: ChangedDef, maxDepth: number): Promise<SymbolImpact> {
+  // Seed by a precise natural key, NOT the id: Orbit's 64-bit ids lose precision
+  // when round-tripped through JSON, so `id = <number>` would match nothing.
+  const seed =
+    `name = ${lit(def.name)} AND file_path = ${lit(def.file_path)} ` +
+    `AND start_line = ${Number(def.start_line)} AND end_line = ${Number(def.end_line)}`;
+  const rows = await traverse(seed, maxDepth);
+  const impacted = rows.filter((r) => r.depth >= 1);
+  return { symbol: def.name, resolved: [def], impacted, summary: summarize([def], impacted) };
 }
 
 function summarize(resolved: Definition[], impacted: ImpactedDef[]): ImpactSummary {
@@ -131,21 +188,51 @@ function summarize(resolved: Definition[], impacted: ImpactedDef[]): ImpactSumma
 }
 
 /**
- * Analyze a set of changed symbols (e.g. the definitions touched by an MR) and
- * return both structured impact and a ready-to-post Markdown report. This is the
- * payload a Duo flow posts as a merge-request comment.
+ * Map a set of file changes onto the definitions they touch. For each changed
+ * line we pick the *innermost* (smallest-span) enclosing definition, so editing
+ * one method in a 300-line class reports the method, not the whole class.
  */
-export async function analyzeChange(
-  symbols: string[],
-  opts: { maxDepth?: number } = {},
-): Promise<{ perSymbol: SymbolImpact[]; markdown: string; rollup: RollupSummary }> {
-  const perSymbol: SymbolImpact[] = [];
-  for (const s of symbols) {
-    perSymbol.push(await blastRadius(s, { maxDepth: opts.maxDepth }));
+export async function resolveChangedDefs(changes: FileChange[]): Promise<ChangedDef[]> {
+  const out: ChangedDef[] = [];
+  for (const fc of changes) {
+    if (fc.changedLines.length === 0) continue;
+    const lo = fc.changedLines[0];
+    const hi = fc.changedLines[fc.changedLines.length - 1];
+
+    // Prefer an exact path match; fall back to a path-suffix match if the diff
+    // carries extra leading directories the graph doesn't.
+    const overlap = `start_line <= ${hi} AND end_line >= ${lo}`;
+    let defs = await sql<Definition>(
+      `SELECT ${DEF_COLS_OUT} FROM gl_definition WHERE file_path = ${lit(fc.path)} AND ${overlap}`,
+    );
+    if (defs.length === 0) {
+      defs = await sql<Definition>(
+        `SELECT ${DEF_COLS_OUT} FROM gl_definition WHERE file_path LIKE ${lit(`%/${fc.path}`)} AND ${overlap}`,
+      );
+    }
+    if (defs.length === 0) continue;
+
+    const chosen = new Map<string, ChangedDef>();
+    for (const ln of fc.changedLines) {
+      let best: Definition | null = null;
+      let bestSpan = Infinity;
+      for (const d of defs) {
+        if (d.start_line <= ln && d.end_line >= ln) {
+          const span = d.end_line - d.start_line;
+          if (span < bestSpan) {
+            bestSpan = span;
+            best = d;
+          }
+        }
+      }
+      if (!best) continue;
+      const existing = chosen.get(best.id);
+      if (existing) existing.changed_lines.push(ln);
+      else chosen.set(best.id, { ...best, changed_lines: [ln] });
+    }
+    out.push(...chosen.values());
   }
-  const rollup = rollupOf(perSymbol);
-  const markdown = renderMarkdown(perSymbol, rollup);
-  return { perSymbol, markdown, rollup };
+  return out;
 }
 
 export interface RollupSummary {
@@ -179,6 +266,53 @@ function rollupOf(per: SymbolImpact[]): RollupSummary {
   };
 }
 
+/**
+ * Analyze a set of changed symbols *named by hand* (e.g. for the CLI/agent that
+ * already knows the names) and return structured impact + a Markdown report.
+ */
+export async function analyzeChange(
+  symbols: string[],
+  opts: { maxDepth?: number } = {},
+): Promise<{ perSymbol: SymbolImpact[]; markdown: string; rollup: RollupSummary }> {
+  const maxDepth = clampDepth(opts.maxDepth);
+  const perSymbol: SymbolImpact[] = [];
+  for (const s of symbols) perSymbol.push(await blastRadius(s, { maxDepth }));
+  const rollup = rollupOf(perSymbol);
+  return { perSymbol, rollup, markdown: renderMarkdown(perSymbol, rollup) };
+}
+
+/**
+ * Analyze a merge request from its raw unified diff. Parses the diff, resolves
+ * the exact changed definitions, and blast-radiuses each — the zero-hand-naming
+ * path a Duo flow uses: it already has the MR diff, so it just passes it here.
+ */
+export async function analyzeDiff(
+  diff: string,
+  opts: { maxDepth?: number } = {},
+): Promise<{
+  changed: ChangedDef[];
+  perSymbol: SymbolImpact[];
+  markdown: string;
+  rollup: RollupSummary;
+}> {
+  const maxDepth = clampDepth(opts.maxDepth);
+  const changes = parseUnifiedDiff(diff);
+  const changed = await resolveChangedDefs(changes);
+
+  const perSymbol: SymbolImpact[] = [];
+  for (const def of changed) perSymbol.push(await blastRadiusFromDef(def, maxDepth));
+
+  const rollup = rollupOf(perSymbol);
+  const intro =
+    changes.length === 0
+      ? "_No textual changes found in the diff._"
+      : changed.length === 0
+        ? `_Parsed ${changes.length} changed file(s), but none of the changed lines fall inside a definition Orbit has indexed (new file, comments-only, or an un-indexed language)._`
+        : `Resolved **${changed.length} changed definition(s)** across ${changes.length} file(s) directly from the diff.`;
+
+  return { changed, perSymbol, rollup, markdown: renderMarkdown(perSymbol, rollup, { intro }) };
+}
+
 const RISK_BADGE: Record<ImpactSummary["risk"], string> = {
   none: "🟢 none",
   low: "🟢 low",
@@ -186,10 +320,29 @@ const RISK_BADGE: Record<ImpactSummary["risk"], string> = {
   high: "🔴 high",
 };
 
-function renderMarkdown(per: SymbolImpact[], roll: RollupSummary): string {
+/** Distinct test files appearing anywhere in the analyzed blast radius. */
+function testFilesInRadius(per: SymbolImpact[]): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const s of per) {
+    for (const d of s.impacted) {
+      if (isTestFile(d.file_path)) counts.set(d.file_path, (counts.get(d.file_path) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+function renderMarkdown(
+  per: SymbolImpact[],
+  roll: RollupSummary,
+  opts: { intro?: string } = {},
+): string {
   const lines: string[] = [];
   lines.push("## 🛰️ Orbit Impact Analysis");
   lines.push("");
+  if (opts.intro) {
+    lines.push(opts.intro);
+    lines.push("");
+  }
   lines.push(
     `**Overall risk: ${RISK_BADGE[roll.highest_risk]}** — ` +
       `${roll.total_impacted_defs} dependent definition(s) across ${roll.files_touched} file(s) ` +
@@ -209,13 +362,13 @@ function renderMarkdown(per: SymbolImpact[], roll: RollupSummary): string {
       lines.push("");
       continue;
     }
-    const where = s.resolved
-      .map((r) => `\`${r.file_path}:${r.start_line}\``)
-      .join(", ");
+    const where = s.resolved.map((r) => `\`${r.file_path}:${r.start_line}\``).join(", ");
     lines.push(
       `### \`${s.symbol}\` — ${RISK_BADGE[s.summary.risk]} (${s.summary.total_impacted} impacted)`,
     );
-    lines.push(`Defined in ${where}${s.summary.ambiguous ? " _(ambiguous — multiple definitions)_" : ""}.`);
+    lines.push(
+      `Defined in ${where}${s.summary.ambiguous ? " _(ambiguous — multiple definitions)_" : ""}.`,
+    );
     lines.push("");
     if (s.impacted.length === 0) {
       lines.push("_No callers found — safe to change in isolation._");
@@ -237,10 +390,29 @@ function renderMarkdown(per: SymbolImpact[], roll: RollupSummary): string {
     lines.push("");
   }
 
+  // Actionable: which tests actually exercise this change.
+  const tests = testFilesInRadius(per);
+  if (tests.size > 0) {
+    lines.push("### ✅ Tests to run");
+    lines.push("These test files sit in the blast radius — run them to validate the change:");
+    lines.push("");
+    for (const [file, n] of [...tests].sort((a, b) => b[1] - a[1])) {
+      lines.push(`- \`${file}\` _(${n} test definition(s) in radius)_`);
+    }
+    lines.push("");
+  } else if (roll.total_impacted_defs > 0) {
+    lines.push("### ✅ Tests to run");
+    lines.push(
+      "> ⚠️ **No test files appear anywhere in the blast radius.** This change is " +
+        "effectively untested — consider adding coverage before merging.",
+    );
+    lines.push("");
+  }
+
   lines.push("---");
   lines.push(
     "<sub>Computed from the GitLab Knowledge Graph (Orbit) call graph — true dependents, not text search. " +
-      "Generated by [orbit-impact](https://gitlab.com/).</sub>",
+      "Generated by [orbit-impact](https://github.com/codewithfourtix/orbit-impact).</sub>",
   );
   return lines.join("\n");
 }

@@ -31,35 +31,66 @@ real `CALLS` edges between definitions. But Orbit Local only exposes a raw
 
 ## The solution
 
-`orbit-impact` wraps Orbit's graph into four typed tools an agent can actually
+`orbit-impact` wraps Orbit's graph into five typed tools an agent can actually
 use, with the recursive call-graph traversal baked in:
 
 | Tool | What it answers |
 |---|---|
-| `index_repo` | Build/refresh the Orbit graph for a repo. |
+| `analyze_diff` | **Give it a raw MR diff** — it resolves the exact changed definitions itself and returns a ready-to-post impact report. No hand-naming, no ambiguity. |
+| `analyze_change` | Same report, but for symbols you name by hand. |
+| `blast_radius` | **Every definition that directly or transitively calls a symbol** — the true impact set, with a risk rating. |
 | `find_symbol` | Where is this symbol defined? (disambiguation) |
-| `blast_radius` | **Every definition that directly or transitively calls this symbol** — the true impact set, with a risk rating. |
-| `analyze_change` | Blast radius for *all* symbols changed by an MR, plus a ready-to-post Markdown report. |
+| `index_repo` | Build/refresh the Orbit graph for a repo. |
 
 Because it reads Orbit's `CALLS` edges, the answer is **exact**: no false
 positives from same-named symbols, and it follows the call chain as many hops as
 you ask for.
 
-### Real example (the `requests` library)
+### The headline trick: a diff in, the true blast radius out
 
-Changing `Session.send` — `analyze_change(["send"])` returns:
+A reviewer (or an agent reviewing an MR) already has the diff. `analyze_diff`
+parses it, intersects the changed line ranges with Orbit's definition spans, and
+picks the **innermost enclosing definition** for each change — so you analyze
+*exactly what the MR touched*, pinned to one file and line. The name-ambiguity
+problem just disappears.
+
+**Real example — the `requests` library.** A diff that edits one line inside
+`Session.send`:
+
+```bash
+git diff | orbit-impact diff
+```
 
 > ## 🛰️ Orbit Impact Analysis
-> **Overall risk: 🔴 high** — 48 dependent definition(s) across 3 file(s)…
+> Resolved **1 changed definition** across 1 file directly from the diff.
+> **Overall risk: 🔴 high** — 40 dependent definitions across 2 files…
+
+The name `send` matches **5** definitions in `requests` (two in `adapters.py`,
+two in `sessions.py`, one in a test). A plain `grep send` drowns you in matches;
+naming the symbol by hand is ambiguous. The *diff* pins it to exactly
+`sessions.py:752` and walks the real call graph from there — catching indirect
+callers many hops out that `grep` never shows, and flagging every test in the
+radius 🧪.
+
+### Self-contained example — the `shopfast` demo repo
+
+[`orbit-impact-demo`](https://gitlab.com/aalizulfiqar46/orbit-impact-demo) is a
+tiny billing app whose tests cover the pricing layer but **not** the
+order/invoice layer. Editing `order_total` and running `orbit-impact diff`:
+
+> **Overall risk: 🟡 medium** — 3 dependent definitions across 2 files.
 > | Dependent | Location | Hops |
 > |---|---|---|
-> | `handle_401` | `src/requests/auth.py:273` | 1 |
-> | `resolve_redirects` | `src/requests/sessions.py:186` | 1 |
-> | `request` | `src/requests/sessions.py:557` | 1 |
-> | …48 total, tests auto-flagged 🧪 | | |
+> | `create_invoice` | `shopfast/invoicing.py:6` | 1 |
+> | `checkout` | `shopfast/orders.py:12` | 1 |
+> | `monthly_statement` | `shopfast/invoicing.py:12` | 2 |
+>
+> ### ✅ Tests to run
+> ⚠️ **No test files appear anywhere in the blast radius** — this change is
+> effectively untested.
 
-`grep send` would drown you in matches and still miss `handle_401` (an indirect
-caller). The graph doesn't.
+`monthly_statement` is two hops out — an indirect caller — and the tool proves
+the change is untested. That's the answer reviewers actually need.
 
 ---
 
@@ -107,11 +138,23 @@ npm run build
 ### 3. Index a repository
 
 ```bash
-node dist/index.js   # then call index_repo, or just:
-orbit index /path/to/your/repo
+orbit index /path/to/your/repo        # or use the index_repo tool
 ```
 
-### 4. Wire it into an MCP client
+### 4a. Use it as a CLI (no MCP client needed)
+
+The fastest way to feel it — pipe a diff straight in:
+
+```bash
+git diff main | node dist/index.js diff      # → the Markdown impact report
+node dist/index.js analyze order_total       # by symbol name
+node dist/index.js blast send src/requests/sessions.py
+node dist/index.js help
+```
+
+Add `--json` for structured output, `--max-depth N` to control traversal depth.
+
+### 4b. Wire it into an MCP client
 
 **Claude Code / Cursor / any MCP client** — add to your MCP config:
 
@@ -135,6 +178,17 @@ npm run smoke -- send        # impact report for a symbol in the indexed repo
 ---
 
 ## Tool reference
+
+<details>
+<summary><code>analyze_diff(diff, max_depth?)</code></summary>
+
+The headline tool. Parses a unified diff, resolves the **innermost enclosing
+definition** for every changed line (so a one-method edit in a big class reports
+the method, not the class), and blast-radiuses each. Returns `changed` (the
+resolved definitions), `perSymbol`, a `rollup`, and a `markdown` report ready to
+post on an MR. No symbol names required, and no ambiguity — the diff pins each
+change to one file and line.
+</details>
 
 <details>
 <summary><code>blast_radius(symbol, file_path?, max_depth?)</code></summary>

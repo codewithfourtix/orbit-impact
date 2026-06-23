@@ -13,12 +13,20 @@ Run `grep -rn "def send" src/ | wc -l` and `grep -rn "send(" . | wc -l` — show
 under-matches, the other returns a wall of noise. "Grep can't follow the call
 graph. So the scary *indirect* callers stay invisible."
 
-**[0:20–0:45] Orbit = the GitLab Knowledge Graph.**
+**[0:20–0:45] Orbit = the GitLab Knowledge Graph + the one-line reveal.**
 > "GitLab Orbit indexes the repo into a real graph — with actual CALLS edges
-> between functions."
+> between functions. orbit-impact turns that into one command."
 
-Run `orbit index ~/requests --stats` (pre-warmed). One line: "907 definitions,
-2114 call edges, in under a second."
+Run `orbit index ~/requests --stats` (pre-warmed): "917 definitions, 2123 call
+edges, indexed in under a second." Then the money shot — pipe the change in:
+
+```bash
+git diff | orbit-impact diff
+```
+
+> "I don't even name the function. It reads the diff, finds the exact definition
+> I touched, and walks the call graph." (The name `send` is ambiguous — 5
+> definitions — but the diff pins it to exactly `sessions.py:752`.)
 
 **[0:45–1:05] The artifact.** *(screen: GitLab, the merge request)*
 Open an MR that edits `Session.send`. "I'll run our published AI Catalog agent,
@@ -26,9 +34,9 @@ Orbit Impact Analyzer, on this MR." Trigger it.
 
 **[1:05–1:55] The payoff.** *(the agent posts the comment)*
 Let the 🛰️ Orbit Impact Analysis comment render. Narrate the highlights:
-> "48 dependents across 3 files. Risk: high. It found `handle_401` — an
-> *indirect* caller two hops out that grep never showed. Every test in the blast
-> radius is flagged. And it warns that some callers have no test coverage."
+> "40 true dependents across 2 files. Risk: high. It found callers two hops out
+> that grep never shows. Every test in the blast radius is flagged 🧪, and it
+> tells you exactly which test files to run."
 
 Then point at the auto-opened issue: "It didn't just talk — it acted: opened an
 issue to add the missing tests."
